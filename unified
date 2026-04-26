@@ -1,0 +1,513 @@
+import math
+import time
+import random
+import os
+from typing import List, Tuple, Dict, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+
+# -------------------------
+# Determinism
+# -------------------------
+SEED = int(os.environ.get("AGENT_SEED", "1337"))
+random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+torch.cuda.manual_seed_all(SEED)
+
+# -------------------------
+# Config
+# -------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ENC_DIM = 128
+DEC_DIM = 192
+MAX_MEM_NODES = 4096
+MEM_EVICT_BATCH = 64
+EMBED_DIM = 256
+VOCAB_SIZE = 256 + 4
+BOS_ID = 256
+EOS_ID = 257
+CTX_ID = 258
+PAD_ID = 259
+TEMPERATURE = 1.0
+TOP_K = 40
+SLIDING_WINDOW = 512
+INFO_NCE_TAU = 0.07
+GRAD_CLIP = 1.0
+XAVIER_GAIN = 0.5
+
+# -------------------------
+# Utils
+# -------------------------
+def xavier_init(module):
+if isinstance(module, (nn.Linear, nn.Conv1d, nn.Embedding)):
+nn.init.xavier_uniform_(module.weight, gain=XAVIER_GAIN)
+if getattr(module, "bias", None) is not None:
+nn.init.zeros_(module.bias)
+
+def top_k_logits(logits, k):
+if k == 0:
+return logits
+v, _ = torch.topk(logits, k)
+min_topk = v[:, -1].unsqueeze(1)
+return torch.where(logits < min_topk, torch.full_like(logits, -1e10), logits)
+
+# -------------------------
+# Tokenizer
+# -------------------------
+class SimpleByteTokenizer:
+def encode(self, data: bytes):
+return [b for b in data]
+
+def decode(self, ids):
+return bytes([i for i in ids if 0 <= i < 256])
+
+def add_specials(self, seq, bos=True, eos=True):
+out = []
+if bos: out.append(BOS_ID)
+out.extend(seq)
+if eos: out.append(EOS_ID)
+return out
+
+# -------------------------
+# Augmentation
+# -------------------------
+def augment_bytes(ids, p_drop=0.1, p_mask=0.1, p_noise=0.05):
+B, T = ids.shape
+aug = ids.clone()
+
+drop = torch.rand(B, T, device=ids.device) < p_drop
+mask = torch.rand(B, T, device=ids.device) < p_mask
+noise = torch.rand(B, T, device=ids.device) < p_noise
+
+aug[drop] = 0
+aug[mask] = 0
+rand_bytes = torch.randint(0, 256, (B, T), device=ids.device)
+aug[noise] = rand_bytes[noise]
+
+return aug
+
+# -------------------------
+# Encoder
+# -------------------------
+class MicroEncoder(nn.Module):
+def __init__(self):
+super().__init__()
+self.emb = nn.Embedding(256, EMBED_DIM)
+self.conv = nn.Conv1d(EMBED_DIM, ENC_DIM, 5, padding=2)
+self.pool = nn.AdaptiveAvgPool1d(1)
+xavier_init(self.emb)
+xavier_init(self.conv)
+
+def forward(self, x):
+x = self.emb(x).transpose(1, 2)
+x = F.gelu(self.conv(x))
+x = self.pool(x).squeeze(-1)
+return x
+
+# -------------------------
+# Memory with MMR + freshness (Optimized + FIFO Eviction)
+# -------------------------
+class MemoryNode:
+def __init__(self, nid, vec, created):
+self.id = nid
+self.vec = vec.cpu()
+self.created = created
+self.strength = 1.0
+
+class LatentMemoryField:
+def __init__(self):
+self.nodes = {}
+self.memory_bank = None
+self.memory_ids = []
+self.next_id = 0
+
+def ingest(self, vecs):
+now = time.time()
+vecs_cpu = vecs.detach().cpu()
+
+for v in vecs_cpu:
+self.nodes[self.next_id] = MemoryNode(self.next_id, v, now)
+self.memory_ids.append(self.next_id)
+self.next_id += 1
+
+if self.memory_bank is None:
+self.memory_bank = vecs_cpu
+else:
+self.memory_bank = torch.cat([self.memory_bank, vecs_cpu], dim=0)
+
+# FIFO eviction
+while len(self.nodes) > MAX_MEM_NODES:
+evict_count = min(MEM_EVICT_BATCH, len(self.nodes) - MAX_MEM_NODES)
+for _ in range(evict_count):
+oldest_id = self.memory_ids.pop(0)
+del self.nodes[oldest_id]
+if self.memory_bank is not None and self.memory_bank.size(0) > 0:
+self.memory_bank = self.memory_bank[evict_count:]
+else:
+self.memory_bank = None
+
+def retrieve(self, q, k=8, lambda_div=0.3):
+if self.memory_bank is None or self.memory_bank.size(0) == 0:
+return torch.zeros(0, ENC_DIM, device=DEVICE), []
+
+mats = self.memory_bank
+mats_n = mats / (mats.norm(dim=1, keepdim=True) + 1e-8)
+qn = q.cpu() / (q.norm() + 1e-8)
+
+sims = torch.matmul(mats_n, qn)
+
+k = min(k, mats.size(0))
+selected = []
+selected_ids = []
+selected_indices = []
+
+for _ in range(k):
+if not selected:
+idx = torch.argmax(sims).item()
+else:
+sel = mats_n[selected_indices]
+div = torch.max(torch.matmul(mats_n, sel.t()), dim=1).values
+idx = torch.argmax(sims - lambda_div * div).item()
+
+selected_indices.append(idx)
+selected_ids.append(self.memory_ids[idx])
+selected.append(mats[idx])
+
+return torch.stack(selected).to(DEVICE), selected_ids
+
+# -------------------------
+# Projection
+# -------------------------
+class ProjectionBridge(nn.Module):
+def __init__(self):
+super().__init__()
+self.lin = nn.Linear(ENC_DIM, DEC_DIM)
+xavier_init(self.lin)
+
+def forward(self, x):
+return self.lin(x)
+
+# -------------------------
+# Cross Attention (Batched + Masked + NaN-safe)
+# -------------------------
+class CrossAttention(nn.Module):
+def __init__(self, dim, heads=8):
+super().__init__()
+self.q = nn.Linear(dim, dim)
+self.k = nn.Linear(dim, dim)
+self.v = nn.Linear(dim, dim)
+self.o = nn.Linear(dim, dim)
+self.h = heads
+self.scale = (dim // heads) ** -0.5
+
+self.gate = nn.Parameter(torch.tensor(-4.0))
+
+self.last_attn = None
+
+for m in [self.q, self.k, self.v, self.o]:
+xavier_init(m)
+
+def forward(self, x, ctx, ctx_mask=None):
+if ctx is None or ctx.size(1) == 0:
+return x
+
+if self.training and random.random() < 0.2:
+return x
+
+B, T, D = x.shape
+H = self.h
+
+# ctx is [B, K, D]
+q = self.q(x).view(B, T, H, D // H).transpose(1, 2)
+k = self.k(ctx).view(B, -1, H, D // H).transpose(1, 2)
+v = self.v(ctx).view(B, -1, H, D // H).transpose(1, 2)
+
+attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+# Apply padding mask for invalid memory slots
+if ctx_mask is not None:
+mask = ctx_mask.view(B, 1, 1, -1)
+attn = attn.masked_fill(~mask, float('-inf'))
+# NaN safety: if a batch item has zero valid context, zero out instead of -inf
+all_masked = (~mask).all(dim=-1, keepdim=True)
+attn = torch.where(all_masked, torch.zeros_like(attn), attn)
+
+attn = F.softmax(attn, dim=-1)
+self.last_attn = attn.mean(dim=1).detach()
+
+out = torch.matmul(attn, v)
+out = out.transpose(1, 2).contiguous().view(B, T, D)
+
+# Zero-out attention outputs for batch items with zero valid context
+if ctx_mask is not None:
+no_ctx = (~ctx_mask).all(dim=-1).view(B, 1, 1)
+out = out.masked_fill(no_ctx, 0.0)
+
+return x + torch.sigmoid(self.gate) * self.o(out)
+
+# -------------------------
+# Decoder
+# -------------------------
+class DecoderBlock(nn.Module):
+def __init__(self):
+super().__init__()
+self.ln1 = nn.LayerNorm(DEC_DIM)
+self.attn = nn.MultiheadAttention(DEC_DIM, 8, batch_first=True)
+self.ln2 = nn.LayerNorm(DEC_DIM)
+self.cross = CrossAttention(DEC_DIM)
+self.ln3 = nn.LayerNorm(DEC_DIM)
+self.ff = nn.Sequential(
+nn.Linear(DEC_DIM, DEC_DIM * 4),
+nn.SiLU(),
+nn.Linear(DEC_DIM * 4, DEC_DIM)
+)
+
+def forward(self, x, ctx, mask, ctx_mask=None):
+y, _ = self.attn(self.ln1(x), self.ln1(x), self.ln1(x), attn_mask=mask)
+x = x + y
+x = self.cross(self.ln2(x), ctx, ctx_mask)
+x = x + self.ff(self.ln3(x))
+return x
+
+class Decoder(nn.Module):
+def __init__(self):
+super().__init__()
+self.emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
+self.proj = nn.Linear(EMBED_DIM, DEC_DIM)
+self.layers = nn.ModuleList([DecoderBlock() for _ in range(4)])
+self.ln = nn.LayerNorm(DEC_DIM)
+self.out = nn.Linear(DEC_DIM, VOCAB_SIZE, bias=False)
+
+# REMOVED: self.out.weight = self.emb.weight
+# (Since DEC_DIM != EMBED_DIM, this tying caused shape mismatch errors)
+
+xavier_init(self.emb)
+xavier_init(self.proj)
+
+def forward(self, x, ctx=None, ctx_mask=None):
+B, T = x.shape
+x = self.proj(self.emb(x))
+
+mask = torch.triu(torch.ones(T, T, device=x.device), 1).bool()
+
+for l in self.layers:
+x = l(x, ctx, mask, ctx_mask)
+
+return self.out(self.ln(x))
+
+# -------------------------
+# Instrumentation
+# -------------------------
+def get_gate_stats(model):
+return [torch.sigmoid(m.gate).item()
+for m in model.modules() if hasattr(m, "gate")]
+
+def get_attn_entropy(model):
+ents = []
+for m in model.modules():
+if hasattr(m, "last_attn") and m.last_attn is not None:
+p = m.last_attn + 1e-8
+ents.append((-(p * torch.log(p))).sum(-1).mean().item())
+return ents
+
+# -------------------------
+# Trainer (Fixed Batching & Masking)
+# -------------------------
+class Trainer:
+def __init__(self, enc, bridge, dec, mem, tok):
+self.enc = enc
+self.bridge = bridge
+self.dec = dec
+self.mem = mem
+self.tok = tok
+self.opt = AdamW(list(enc.parameters()) +
+list(bridge.parameters()) +
+list(dec.parameters()), lr=3e-4)
+
+def step(self, batch):
+tok = self.tok
+
+enc_ids = [torch.tensor(tok.encode(b)) for b in batch]
+maxlen = max(len(x) for x in enc_ids)
+enc_pad = torch.zeros(len(batch), maxlen, dtype=torch.long)
+for i, x in enumerate(enc_ids):
+enc_pad[i, :len(x)] = x
+enc_pad = enc_pad.to(DEVICE)
+
+z_q = self.enc(enc_pad)
+z_k = self.enc(augment_bytes(enc_pad))
+
+logits = torch.matmul(F.normalize(z_q, dim=1),
+F.normalize(z_k, dim=1).t()) / INFO_NCE_TAU
+labels = torch.arange(z_q.size(0), device=DEVICE)
+loss_contrast = F.cross_entropy(logits, labels)
+
+# Decode preparation
+ids = [torch.tensor(tok.add_specials(tok.encode(b))) for b in batch]
+maxlen = max(len(x) for x in ids)
+pad = torch.full((len(ids), maxlen), PAD_ID, dtype=torch.long)
+for i, x in enumerate(ids):
+pad[i, :len(x)] = x
+pad = pad.to(DEVICE)
+
+# FIXED: Proper memory context batching
+ctxs = []
+for i in range(z_q.size(0)):
+ctx, _ = self.mem.retrieve(z_q[i])
+if ctx.size(0) > 0:
+ctxs.append(self.bridge(ctx.to(DEVICE)))
+else:
+ctxs.append(torch.zeros((0, DEC_DIM), device=DEVICE))
+
+ctx_mask = None
+if any(c.size(0) > 0 for c in ctxs):
+max_k = max(c.size(0) for c in ctxs)
+batched_ctx = torch.zeros((len(ctxs), max_k, DEC_DIM), device=DEVICE)
+ctx_mask = torch.zeros((len(ctxs), max_k), dtype=torch.bool, device=DEVICE)
+
+for i, c in enumerate(ctxs):
+k_len = c.size(0)
+if k_len > 0:
+batched_ctx[i, :k_len, :] = c
+ctx_mask[i, :k_len] = True
+ctx = batched_ctx
+else:
+ctx = None
+
+# Apply batched context and mask
+logits = self.dec(pad, ctx, ctx_mask)
+
+pred = logits[:, :-1].reshape(-1, VOCAB_SIZE)
+tgt = pad[:, 1:].reshape(-1)
+
+loss_next = F.cross_entropy(pred, tgt, ignore_index=PAD_ID)
+loss = loss_next + 0.1 * loss_contrast
+
+self.opt.zero_grad()
+loss.backward()
+torch.nn.utils.clip_grad_norm_(
+list(self.enc.parameters()) + list(self.bridge.parameters()) + list(self.dec.parameters()),
+GRAD_CLIP
+)
+self.opt.step()
+
+# gated ingestion
+if loss_next.item() < 4.0:
+self.mem.ingest(z_q.detach())
+
+# gate warmup
+with torch.no_grad():
+for m in self.dec.modules():
+if hasattr(m, "gate"):
+m.gate += 1e-3
+
+return {
+"loss": loss.item(),
+"gates": get_gate_stats(self.dec),
+"attn_entropy": get_attn_entropy(self.dec)
+}
+
+# -------------------------
+# Agent
+# -------------------------
+class Agent:
+def __init__(self):
+self.tok = SimpleByteTokenizer()
+self.enc = MicroEncoder().to(DEVICE)
+self.bridge = ProjectionBridge().to(DEVICE)
+self.dec = Decoder().to(DEVICE)
+self.mem = LatentMemoryField()
+self.trainer = Trainer(self.enc, self.bridge, self.dec, self.mem, self.tok)
+
+def train(self, batch):
+return self.trainer.step(batch)
+
+@torch.no_grad()
+def generate(self, prompt: bytes, max_new_tokens: int = 128, temperature: float = TEMPERATURE, top_k: int = TOP_K):
+self.enc.eval()
+self.dec.eval()
+
+prompt_ids = self.tok.encode(prompt)
+input_ids = self.tok.add_specials(prompt_ids, bos=True, eos=False)
+input_tensor = torch.tensor([input_ids], dtype=torch.long, device=DEVICE)
+
+# Retrieve memory context from prompt encoding
+z = self.enc(torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE))
+ctx, _ = self.mem.retrieve(z[0], k=8)
+if ctx.size(0) > 0:
+ctx = self.bridge(ctx.to(DEVICE)).unsqueeze(0)
+ctx_mask = torch.ones((1, ctx.size(1)), dtype=torch.bool, device=DEVICE)
+else:
+ctx = None
+ctx_mask = None
+
+generated_ids = []
+for _ in range(max_new_tokens):
+logits = self.dec(input_tensor, ctx, ctx_mask)
+next_logits = logits[:, -1, :] / temperature
+next_logits = top_k_logits(next_logits, top_k)
+probs = F.softmax(next_logits, dim=-1)
+next_token = torch.multinomial(probs, num_samples=1)
+
+tok_id = next_token.item()
+generated_ids.append(tok_id)
+if tok_id == EOS_ID:
+break
+input_tensor = torch.cat([input_tensor, next_token], dim=1)
+
+return self.tok.decode(generated_ids)
+
+def save(self, path: str):
+torch.save({
+'enc': self.enc.state_dict(),
+'bridge': self.bridge.state_dict(),
+'dec': self.dec.state_dict(),
+'opt': self.trainer.opt.state_dict(),
+}, path)
+
+def load(self, path: str):
+ckpt = torch.load(path, map_location=DEVICE)
+self.enc.load_state_dict(ckpt['enc'])
+self.bridge.load_state_dict(ckpt['bridge'])
+self.dec.load_state_dict(ckpt['dec'])
+self.trainer.opt.load_state_dict(ckpt['opt'])
+
+# -------------------------
+# Runnable Entrypoint
+# -------------------------
+if __name__ == "__main__":
+print(f"Device: {DEVICE}")
+agent = Agent()
+
+def get_batches(batch_size=4, seq_len=64):
+pattern = b"the quick brown fox jumps over the lazy dog "
+while True:
+batch = []
+for _ in range(batch_size):
+repeat = (seq_len // len(pattern)) + 2
+data = (pattern * repeat)[:seq_len]
+batch.append(data)
+yield batch
+
+steps = 500
+data_gen = get_batches(batch_size=4)
+
+print("Starting training...")
+for step in range(steps):
+batch = next(data_gen)
+metrics = agent.train(batch)
+if step % 50 == 0:
+print(f"Step {step:03d} | loss: {metrics['loss']:.4f} | gates: {[f'{g:.3f}' for g in metrics['gates']]} | entropy: {[f'{e:.3f}' for e in metrics['attn_entropy']]}")
+
+agent.save("agent.pt")
+print("Checkpoint saved to agent.pt")
+
+# Inference demo
+prompt = b"the quick"
+out = agent.generate(prompt, max_new_tokens=50)
+print(f"\\nPrompt: {prompt}")
+print(f"Generated: {out}")
