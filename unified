@@ -1,513 +1,1466 @@
-import math
-import time
-import random
-import os
-from typing import List, Tuple, Dict, Optional
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import AdamW
-
-# -------------------------
-# Determinism
-# -------------------------
-SEED = int(os.environ.get("AGENT_SEED", "1337"))
-random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-torch.cuda.manual_seed_all(SEED)
-
-# -------------------------
-# Config
-# -------------------------
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ENC_DIM = 128
-DEC_DIM = 192
-MAX_MEM_NODES = 4096
-MEM_EVICT_BATCH = 64
-EMBED_DIM = 256
-VOCAB_SIZE = 256 + 4
-BOS_ID = 256
-EOS_ID = 257
-CTX_ID = 258
-PAD_ID = 259
-TEMPERATURE = 1.0
-TOP_K = 40
-SLIDING_WINDOW = 512
-INFO_NCE_TAU = 0.07
-GRAD_CLIP = 1.0
-XAVIER_GAIN = 0.5
-
-# -------------------------
-# Utils
-# -------------------------
-def xavier_init(module):
-if isinstance(module, (nn.Linear, nn.Conv1d, nn.Embedding)):
-nn.init.xavier_uniform_(module.weight, gain=XAVIER_GAIN)
-if getattr(module, "bias", None) is not None:
-nn.init.zeros_(module.bias)
-
-def top_k_logits(logits, k):
-if k == 0:
-return logits
-v, _ = torch.topk(logits, k)
-min_topk = v[:, -1].unsqueeze(1)
-return torch.where(logits < min_topk, torch.full_like(logits, -1e10), logits)
-
-# -------------------------
-# Tokenizer
-# -------------------------
-class SimpleByteTokenizer:
-def encode(self, data: bytes):
-return [b for b in data]
-
-def decode(self, ids):
-return bytes([i for i in ids if 0 <= i < 256])
-
-def add_specials(self, seq, bos=True, eos=True):
-out = []
-if bos: out.append(BOS_ID)
-out.extend(seq)
-if eos: out.append(EOS_ID)
-return out
-
-# -------------------------
-# Augmentation
-# -------------------------
-def augment_bytes(ids, p_drop=0.1, p_mask=0.1, p_noise=0.05):
-B, T = ids.shape
-aug = ids.clone()
-
-drop = torch.rand(B, T, device=ids.device) < p_drop
-mask = torch.rand(B, T, device=ids.device) < p_mask
-noise = torch.rand(B, T, device=ids.device) < p_noise
-
-aug[drop] = 0
-aug[mask] = 0
-rand_bytes = torch.randint(0, 256, (B, T), device=ids.device)
-aug[noise] = rand_bytes[noise]
-
-return aug
-
-# -------------------------
-# Encoder
-# -------------------------
-class MicroEncoder(nn.Module):
-def __init__(self):
-super().__init__()
-self.emb = nn.Embedding(256, EMBED_DIM)
-self.conv = nn.Conv1d(EMBED_DIM, ENC_DIM, 5, padding=2)
-self.pool = nn.AdaptiveAvgPool1d(1)
-xavier_init(self.emb)
-xavier_init(self.conv)
-
-def forward(self, x):
-x = self.emb(x).transpose(1, 2)
-x = F.gelu(self.conv(x))
-x = self.pool(x).squeeze(-1)
-return x
-
-# -------------------------
-# Memory with MMR + freshness (Optimized + FIFO Eviction)
-# -------------------------
-class MemoryNode:
-def __init__(self, nid, vec, created):
-self.id = nid
-self.vec = vec.cpu()
-self.created = created
-self.strength = 1.0
-
-class LatentMemoryField:
-def __init__(self):
-self.nodes = {}
-self.memory_bank = None
-self.memory_ids = []
-self.next_id = 0
-
-def ingest(self, vecs):
-now = time.time()
-vecs_cpu = vecs.detach().cpu()
-
-for v in vecs_cpu:
-self.nodes[self.next_id] = MemoryNode(self.next_id, v, now)
-self.memory_ids.append(self.next_id)
-self.next_id += 1
-
-if self.memory_bank is None:
-self.memory_bank = vecs_cpu
-else:
-self.memory_bank = torch.cat([self.memory_bank, vecs_cpu], dim=0)
-
-# FIFO eviction
-while len(self.nodes) > MAX_MEM_NODES:
-evict_count = min(MEM_EVICT_BATCH, len(self.nodes) - MAX_MEM_NODES)
-for _ in range(evict_count):
-oldest_id = self.memory_ids.pop(0)
-del self.nodes[oldest_id]
-if self.memory_bank is not None and self.memory_bank.size(0) > 0:
-self.memory_bank = self.memory_bank[evict_count:]
-else:
-self.memory_bank = None
-
-def retrieve(self, q, k=8, lambda_div=0.3):
-if self.memory_bank is None or self.memory_bank.size(0) == 0:
-return torch.zeros(0, ENC_DIM, device=DEVICE), []
-
-mats = self.memory_bank
-mats_n = mats / (mats.norm(dim=1, keepdim=True) + 1e-8)
-qn = q.cpu() / (q.norm() + 1e-8)
-
-sims = torch.matmul(mats_n, qn)
-
-k = min(k, mats.size(0))
-selected = []
-selected_ids = []
-selected_indices = []
-
-for _ in range(k):
-if not selected:
-idx = torch.argmax(sims).item()
-else:
-sel = mats_n[selected_indices]
-div = torch.max(torch.matmul(mats_n, sel.t()), dim=1).values
-idx = torch.argmax(sims - lambda_div * div).item()
-
-selected_indices.append(idx)
-selected_ids.append(self.memory_ids[idx])
-selected.append(mats[idx])
-
-return torch.stack(selected).to(DEVICE), selected_ids
-
-# -------------------------
-# Projection
-# -------------------------
-class ProjectionBridge(nn.Module):
-def __init__(self):
-super().__init__()
-self.lin = nn.Linear(ENC_DIM, DEC_DIM)
-xavier_init(self.lin)
-
-def forward(self, x):
-return self.lin(x)
-
-# -------------------------
-# Cross Attention (Batched + Masked + NaN-safe)
-# -------------------------
-class CrossAttention(nn.Module):
-def __init__(self, dim, heads=8):
-super().__init__()
-self.q = nn.Linear(dim, dim)
-self.k = nn.Linear(dim, dim)
-self.v = nn.Linear(dim, dim)
-self.o = nn.Linear(dim, dim)
-self.h = heads
-self.scale = (dim // heads) ** -0.5
-
-self.gate = nn.Parameter(torch.tensor(-4.0))
-
-self.last_attn = None
-
-for m in [self.q, self.k, self.v, self.o]:
-xavier_init(m)
-
-def forward(self, x, ctx, ctx_mask=None):
-if ctx is None or ctx.size(1) == 0:
-return x
-
-if self.training and random.random() < 0.2:
-return x
-
-B, T, D = x.shape
-H = self.h
-
-# ctx is [B, K, D]
-q = self.q(x).view(B, T, H, D // H).transpose(1, 2)
-k = self.k(ctx).view(B, -1, H, D // H).transpose(1, 2)
-v = self.v(ctx).view(B, -1, H, D // H).transpose(1, 2)
-
-attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-# Apply padding mask for invalid memory slots
-if ctx_mask is not None:
-mask = ctx_mask.view(B, 1, 1, -1)
-attn = attn.masked_fill(~mask, float('-inf'))
-# NaN safety: if a batch item has zero valid context, zero out instead of -inf
-all_masked = (~mask).all(dim=-1, keepdim=True)
-attn = torch.where(all_masked, torch.zeros_like(attn), attn)
-
-attn = F.softmax(attn, dim=-1)
-self.last_attn = attn.mean(dim=1).detach()
-
-out = torch.matmul(attn, v)
-out = out.transpose(1, 2).contiguous().view(B, T, D)
-
-# Zero-out attention outputs for batch items with zero valid context
-if ctx_mask is not None:
-no_ctx = (~ctx_mask).all(dim=-1).view(B, 1, 1)
-out = out.masked_fill(no_ctx, 0.0)
-
-return x + torch.sigmoid(self.gate) * self.o(out)
-
-# -------------------------
-# Decoder
-# -------------------------
-class DecoderBlock(nn.Module):
-def __init__(self):
-super().__init__()
-self.ln1 = nn.LayerNorm(DEC_DIM)
-self.attn = nn.MultiheadAttention(DEC_DIM, 8, batch_first=True)
-self.ln2 = nn.LayerNorm(DEC_DIM)
-self.cross = CrossAttention(DEC_DIM)
-self.ln3 = nn.LayerNorm(DEC_DIM)
-self.ff = nn.Sequential(
-nn.Linear(DEC_DIM, DEC_DIM * 4),
-nn.SiLU(),
-nn.Linear(DEC_DIM * 4, DEC_DIM)
-)
-
-def forward(self, x, ctx, mask, ctx_mask=None):
-y, _ = self.attn(self.ln1(x), self.ln1(x), self.ln1(x), attn_mask=mask)
-x = x + y
-x = self.cross(self.ln2(x), ctx, ctx_mask)
-x = x + self.ff(self.ln3(x))
-return x
-
-class Decoder(nn.Module):
-def __init__(self):
-super().__init__()
-self.emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
-self.proj = nn.Linear(EMBED_DIM, DEC_DIM)
-self.layers = nn.ModuleList([DecoderBlock() for _ in range(4)])
-self.ln = nn.LayerNorm(DEC_DIM)
-self.out = nn.Linear(DEC_DIM, VOCAB_SIZE, bias=False)
-
-# REMOVED: self.out.weight = self.emb.weight
-# (Since DEC_DIM != EMBED_DIM, this tying caused shape mismatch errors)
-
-xavier_init(self.emb)
-xavier_init(self.proj)
-
-def forward(self, x, ctx=None, ctx_mask=None):
-B, T = x.shape
-x = self.proj(self.emb(x))
-
-mask = torch.triu(torch.ones(T, T, device=x.device), 1).bool()
-
-for l in self.layers:
-x = l(x, ctx, mask, ctx_mask)
-
-return self.out(self.ln(x))
-
-# -------------------------
-# Instrumentation
-# -------------------------
-def get_gate_stats(model):
-return [torch.sigmoid(m.gate).item()
-for m in model.modules() if hasattr(m, "gate")]
-
-def get_attn_entropy(model):
-ents = []
-for m in model.modules():
-if hasattr(m, "last_attn") and m.last_attn is not None:
-p = m.last_attn + 1e-8
-ents.append((-(p * torch.log(p))).sum(-1).mean().item())
-return ents
-
-# -------------------------
-# Trainer (Fixed Batching & Masking)
-# -------------------------
-class Trainer:
-def __init__(self, enc, bridge, dec, mem, tok):
-self.enc = enc
-self.bridge = bridge
-self.dec = dec
-self.mem = mem
-self.tok = tok
-self.opt = AdamW(list(enc.parameters()) +
-list(bridge.parameters()) +
-list(dec.parameters()), lr=3e-4)
-
-def step(self, batch):
-tok = self.tok
-
-enc_ids = [torch.tensor(tok.encode(b)) for b in batch]
-maxlen = max(len(x) for x in enc_ids)
-enc_pad = torch.zeros(len(batch), maxlen, dtype=torch.long)
-for i, x in enumerate(enc_ids):
-enc_pad[i, :len(x)] = x
-enc_pad = enc_pad.to(DEVICE)
-
-z_q = self.enc(enc_pad)
-z_k = self.enc(augment_bytes(enc_pad))
-
-logits = torch.matmul(F.normalize(z_q, dim=1),
-F.normalize(z_k, dim=1).t()) / INFO_NCE_TAU
-labels = torch.arange(z_q.size(0), device=DEVICE)
-loss_contrast = F.cross_entropy(logits, labels)
-
-# Decode preparation
-ids = [torch.tensor(tok.add_specials(tok.encode(b))) for b in batch]
-maxlen = max(len(x) for x in ids)
-pad = torch.full((len(ids), maxlen), PAD_ID, dtype=torch.long)
-for i, x in enumerate(ids):
-pad[i, :len(x)] = x
-pad = pad.to(DEVICE)
-
-# FIXED: Proper memory context batching
-ctxs = []
-for i in range(z_q.size(0)):
-ctx, _ = self.mem.retrieve(z_q[i])
-if ctx.size(0) > 0:
-ctxs.append(self.bridge(ctx.to(DEVICE)))
-else:
-ctxs.append(torch.zeros((0, DEC_DIM), device=DEVICE))
-
-ctx_mask = None
-if any(c.size(0) > 0 for c in ctxs):
-max_k = max(c.size(0) for c in ctxs)
-batched_ctx = torch.zeros((len(ctxs), max_k, DEC_DIM), device=DEVICE)
-ctx_mask = torch.zeros((len(ctxs), max_k), dtype=torch.bool, device=DEVICE)
-
-for i, c in enumerate(ctxs):
-k_len = c.size(0)
-if k_len > 0:
-batched_ctx[i, :k_len, :] = c
-ctx_mask[i, :k_len] = True
-ctx = batched_ctx
-else:
-ctx = None
-
-# Apply batched context and mask
-logits = self.dec(pad, ctx, ctx_mask)
-
-pred = logits[:, :-1].reshape(-1, VOCAB_SIZE)
-tgt = pad[:, 1:].reshape(-1)
-
-loss_next = F.cross_entropy(pred, tgt, ignore_index=PAD_ID)
-loss = loss_next + 0.1 * loss_contrast
-
-self.opt.zero_grad()
-loss.backward()
-torch.nn.utils.clip_grad_norm_(
-list(self.enc.parameters()) + list(self.bridge.parameters()) + list(self.dec.parameters()),
-GRAD_CLIP
-)
-self.opt.step()
-
-# gated ingestion
-if loss_next.item() < 4.0:
-self.mem.ingest(z_q.detach())
-
-# gate warmup
-with torch.no_grad():
-for m in self.dec.modules():
-if hasattr(m, "gate"):
-m.gate += 1e-3
-
-return {
-"loss": loss.item(),
-"gates": get_gate_stats(self.dec),
-"attn_entropy": get_attn_entropy(self.dec)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>canceled Frontier Model</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+body { background-color: #0f172a; color: #f8fafc; font-family: 'Inter', sans-serif; overflow: hidden; }
+.glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
+.log-container::-webkit-scrollbar { width: 6px; }
+.log-container::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+.chat-container::-webkit-scrollbar { width: 6px; }
+.chat-container::-webkit-scrollbar-thumb { background: #6b21a8; border-radius: 4px; }
+.source-modal-overlay { background: rgba(0, 0, 0, 0.8); z-index: 50; }
+input[type=range] { accent-color: #22d3ee; }
+.glow-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+.gemini-gradient { background: linear-gradient(90deg, #4285f4, #9b72cb, #d96570); background-clip: text; -webkit-background-clip: text; color: transparent; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// --- LOCAL INDEXEDDB LAYER ---
+const DB_NAME = 'HDC_v8';
+const DB_VERSION = 1;
+
+let dbPromise = null;
+function getDB() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('nodes')) db.createObjectStore('nodes', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+        // Secondary index stores for future full-indexed queries
+        if (!db.objectStoreNames.contains('nodes_by_score')) db.createObjectStore('nodes_by_score', { keyPath: 'id' });
+      };
+      req.onsuccess = (e) => resolve(e.target.result);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  }
+  return dbPromise;
 }
 
-# -------------------------
-# Agent
-# -------------------------
-class Agent:
-def __init__(self):
-self.tok = SimpleByteTokenizer()
-self.enc = MicroEncoder().to(DEVICE)
-self.bridge = ProjectionBridge().to(DEVICE)
-self.dec = Decoder().to(DEVICE)
-self.mem = LatentMemoryField()
-self.trainer = Trainer(self.enc, self.bridge, self.dec, self.mem, self.tok)
+async function dbPut(store, value) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const st = tx.objectStore(store);
+    const r = st.put(value);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
 
-def train(self, batch):
-return self.trainer.step(batch)
+async function dbDelete(store, key) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const st = tx.objectStore(store);
+    const r = st.delete(key);
+    r.onsuccess = () => resolve();
+    r.onerror = () => reject(r.error);
+  });
+}
 
-@torch.no_grad()
-def generate(self, prompt: bytes, max_new_tokens: int = 128, temperature: float = TEMPERATURE, top_k: int = TOP_K):
-self.enc.eval()
-self.dec.eval()
+async function dbGetAll(store) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const st = tx.objectStore(store);
+    const r = st.getAll();
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
 
-prompt_ids = self.tok.encode(prompt)
-input_ids = self.tok.add_specials(prompt_ids, bos=True, eos=False)
-input_tensor = torch.tensor([input_ids], dtype=torch.long, device=DEVICE)
+async function dbClear(store) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const st = tx.objectStore(store);
+    const r = st.clear();
+    r.onsuccess = () => resolve();
+    r.onerror = () => reject(r.error);
+  });
+}
 
-# Retrieve memory context from prompt encoding
-z = self.enc(torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE))
-ctx, _ = self.mem.retrieve(z[0], k=8)
-if ctx.size(0) > 0:
-ctx = self.bridge(ctx.to(DEVICE)).unsqueeze(0)
-ctx_mask = torch.ones((1, ctx.size(1)), dtype=torch.bool, device=DEVICE)
-else:
-ctx = None
-ctx_mask = None
+// --- INLINE WEB WORKER (REAL-VALUED HRR + k-NN GRAPH) ---
+const hdcWorkerCode = `
+const D = 2048;
+const K_NEIGHBORS = 16;
 
-generated_ids = []
-for _ in range(max_new_tokens):
-logits = self.dec(input_tensor, ctx, ctx_mask)
-next_logits = logits[:, -1, :] / temperature
-next_logits = top_k_logits(next_logits, top_k)
-probs = F.softmax(next_logits, dim=-1)
-next_token = torch.multinomial(probs, num_samples=1)
+// --- RNG ---
+function mulberry32(a) {
+  return function() {
+    var t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+}
 
-tok_id = next_token.item()
-generated_ids.append(tok_id)
-if tok_id == EOS_ID:
-break
-input_tensor = torch.cat([input_tensor, next_token], dim=1)
+function hashString(str) {
+  let h = 0;
+  for(let i = 0; i < str.length; i++) h = Math.imul(31, h) + str.charCodeAt(i) | 0;
+  return h;
+}
 
-return self.tok.decode(generated_ids)
+function tokenize(str) {
+  return str.toLowerCase().match(/\\w+(?:'\\w+)?|\\S/g) || [];
+}
 
-def save(self, path: str):
-torch.save({
-'enc': self.enc.state_dict(),
-'bridge': self.bridge.state_dict(),
-'dec': self.dec.state_dict(),
-'opt': self.trainer.opt.state_dict(),
-}, path)
+// --- 8-BIT QUANTIZED REAL-VALUED PACKING ---
+function packReal(vec) {
+  const bytes = new Uint8Array(D);
+  for(let i=0; i<D; i++) {
+    const v = Math.max(-1, Math.min(1, vec[i]));
+    bytes[i] = Math.round((v + 1) / 2 * 255);
+  }
+  return btoa(String.fromCharCode.apply(null, bytes));
+}
 
-def load(self, path: str):
-ckpt = torch.load(path, map_location=DEVICE)
-self.enc.load_state_dict(ckpt['enc'])
-self.bridge.load_state_dict(ckpt['bridge'])
-self.dec.load_state_dict(ckpt['dec'])
-self.trainer.opt.load_state_dict(ckpt['opt'])
+function unpackReal(packed) {
+  const s = atob(packed);
+  const bytes = new Uint8Array(s.length);
+  for(let i=0; i<s.length; i++) bytes[i] = s.charCodeAt(i);
+  const vec = new Float32Array(D);
+  for(let i=0; i<D; i++) vec[i] = (bytes[i] / 255) * 2 - 1;
+  let n = 0;
+  for(let i=0; i<D; i++) n += vec[i]*vec[i];
+  n = Math.sqrt(n);
+  if(n > 0) for(let i=0; i<D; i++) vec[i] /= n;
+  return vec;
+}
 
-# -------------------------
-# Runnable Entrypoint
-# -------------------------
-if __name__ == "__main__":
-print(f"Device: {DEVICE}")
-agent = Agent()
+// --- CACHES ---
+const vecCache = new Map();
+function resolve(id, packed) {
+  if(!packed) return new Float32Array(D);
+  if(vecCache.has(id)) return vecCache.get(id);
+  const v = unpackReal(packed);
+  vecCache.set(id, v);
+  return v;
+}
 
-def get_batches(batch_size=4, seq_len=64):
-pattern = b"the quick brown fox jumps over the lazy dog "
-while True:
-batch = []
-for _ in range(batch_size):
-repeat = (seq_len // len(pattern)) + 2
-data = (pattern * repeat)[:seq_len]
-batch.append(data)
-yield batch
+let tokCache = {};
+function getTokenVector(t) {
+  if(tokCache[t]) return tokCache[t];
+  const r = mulberry32(hashString(t)*1337);
+  const v = new Float32Array(D);
+  for(let i=0; i<D; i++) v[i] = r() > 0.5 ? 1 : -1;
+  tokCache[t] = v;
+  return v;
+}
 
-steps = 500
-data_gen = get_batches(batch_size=4)
+// --- UNIT ROLE VECTORS ---
+function makeUnit(seed) {
+  const r = mulberry32(seed);
+  const v = new Float32Array(D);
+  for(let i=0; i<D; i++) v[i] = r()*2-1;
+  let n=0; for(let i=0;i<D;i++) n+=v[i]*v[i];
+  n=Math.sqrt(n); for(let i=0;i<D;i++) v[i]/=n;
+  return v;
+}
+const ROLE_AGENT = makeUnit(1001);
+const ROLE_PRED = makeUnit(1002);
+const ROLE_PATIENT = makeUnit(1003);
+const ROLE_CONTEXT = makeUnit(1004);
 
-print("Starting training...")
-for step in range(steps):
-batch = next(data_gen)
-metrics = agent.train(batch)
-if step % 50 == 0:
-print(f"Step {step:03d} | loss: {metrics['loss']:.4f} | gates: {[f'{g:.3f}' for g in metrics['gates']]} | entropy: {[f'{e:.3f}' for e in metrics['attn_entropy']]}")
+// --- PERMUTATION ---
+const perm = new Int32Array(D);
+for(let i=0; i<D; i++) perm[i] = i;
+const rp = mulberry32(42);
+for(let i=D-1; i>0; i--) {
+  const j = Math.floor(rp()*(i+1));
+  const t=perm[i]; perm[i]=perm[j]; perm[j]=t;
+}
+function applyPerm(v) {
+  const o = new Float32Array(D);
+  for(let i=0; i<D; i++) o[i] = v[perm[i]];
+  return o;
+}
 
-agent.save("agent.pt")
-print("Checkpoint saved to agent.pt")
+// --- POSITION SHIFT ---
+function shiftVector(v, pos) {
+  const o = new Float32Array(D);
+  for(let i=0; i<D; i++) o[(i+pos)%D] = v[i];
+  return o;
+}
 
-# Inference demo
-prompt = b"the quick"
-out = agent.generate(prompt, max_new_tokens=50)
-print(f"\\nPrompt: {prompt}")
-print(f"Generated: {out}")
+// --- FFT (iterative, in-place) ---
+function fft(real, imag, inv) {
+  const n = real.length;
+  let j = 0;
+  for(let i=1; i<n; i++) {
+    let bit = n>>1;
+    for(; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if(i < j) {
+      let tmp = real[i]; real[i] = real[j]; real[j] = tmp;
+      tmp = imag[i]; imag[i] = imag[j]; imag[j] = tmp;
+    }
+  }
+  for(let len=2; len<=n; len <<= 1) {
+    const ang = 2*Math.PI/len * (inv ? -1 : 1);
+    const wc = Math.cos(ang), ws = Math.sin(ang);
+    for(let i=0; i<n; i+=len) {
+      let wr=1, wi=0;
+      for(let k=0; k<len/2; k++) {
+        const uR = real[i+k], uI = imag[i+k];
+        const vR = real[i+k+len/2]*wr - imag[i+k+len/2]*wi;
+        const vI = real[i+k+len/2]*wi + imag[i+k+len/2]*wr;
+        real[i+k] = uR + vR; imag[i+k] = uI + vI;
+        real[i+k+len/2] = uR - vR; imag[i+k+len/2] = uI - vI;
+        const nwr = wr*wc - wi*ws;
+        wi = wr*ws + wi*wc; wr = nwr;
+      }
+    }
+  }
+  if(inv) for(let i=0; i<n; i++) { real[i] /= n; imag[i] /= n; }
+}
+
+// --- ISOLATED FFT CONTEXTS (no cross-contamination) ---
+const CONV = {
+  rA:new Float32Array(D), iA:new Float32Array(D),
+  rB:new Float32Array(D), iB:new Float32Array(D),
+  rR:new Float32Array(D), iR:new Float32Array(D)
+};
+const CORR = {
+  rA:new Float32Array(D), iA:new Float32Array(D),
+  rB:new Float32Array(D), iB:new Float32Array(D),
+  rR:new Float32Array(D), iR:new Float32Array(D)
+};
+
+function circConv(a, b, out) {
+  CONV.rA.set(a); CONV.iA.fill(0);
+  CONV.rB.set(b); CONV.iB.fill(0);
+  fft(CONV.rA, CONV.iA, false);
+  fft(CONV.rB, CONV.iB, false);
+  for(let i=0; i<D; i++) {
+    CONV.rR[i] = CONV.rA[i]*CONV.rB[i] - CONV.iA[i]*CONV.iB[i];
+    CONV.iR[i] = CONV.rA[i]*CONV.iB[i] + CONV.iA[i]*CONV.rB[i];
+  }
+  fft(CONV.rR, CONV.iR, true);
+  out.set(CONV.rR);
+}
+
+function circCorr(a, b, out) {
+  CORR.rA.set(a); CORR.iA.fill(0);
+  CORR.rB.set(b); CORR.iB.fill(0);
+  fft(CORR.rA, CORR.iA, false);
+  fft(CORR.rB, CORR.iB, false);
+  for(let i=0; i<D; i++) {
+    CORR.rR[i] = CORR.rA[i]*CORR.rB[i] + CORR.iA[i]*Here is **V8.0** — a ground-up refactor that addresses every diagnosed failure mode: real-valued vectors (no binarization), isolated FFT contexts, an incrementally maintained k-NN graph for O(N·k) operations, IndexedDB with secondary indexes, probabilistic acceptance with attractor penalties, and a coherence-guarded generator. [page:1]
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>canceled Frontier Model</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+body { background-color: #0f172a; color: #f8fafc; font-family: 'Inter', sans-serif; overflow: hidden; }
+.glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
+.log-container::-webkit-scrollbar { width: 6px; }
+.log-container::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+.chat-container::-webkit-scrollbar { width: 6px; }
+.chat-container::-webkit-scrollbar-thumb { background: #6b21a8; border-radius: 4px; }
+.source-modal-overlay { background: rgba(0, 0, 0, 0.8); z-index: 50; }
+input[type=range] { accent-color: #22d3ee; }
+.glow-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+.gemini-gradient { background: linear-gradient(90deg, #4285f4, #9b72cb, #d96570); background-clip: text; -webkit-background-clip: text; color: transparent; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// --- LOCAL INDEXEDDB LAYER (V8 with secondary indexes) ---
+const DB_NAME = 'HDC_v8';
+const DB_VERSION = 2;
+
+let dbPromise = null;
+function getDB() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('nodes')) {
+          const store = db.createObjectStore('nodes', { keyPath: 'id' });
+          store.createIndex('by_score', 'score', { unique: false });
+          store.createIndex('by_timestamp', 'timestamp', { unique: false });
+          store.createIndex('by_lsh', 'lshHash', { unique: false });
+        }
+        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+      };
+      req.onsuccess = (e) => resolve(e.target.result);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  }
+  return dbPromise;
+}
+
+async function dbPut(store, value) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const st = tx.objectStore(store);
+    const r = st.put(value);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+
+async function dbDelete(store, key) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const st = tx.objectStore(store);
+    const r = st.delete(key);
+    r.onsuccess = () => resolve();
+    r.onerror = () => reject(r.error);
+  });
+}
+
+async function dbGetAll(store) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const st = tx.objectStore(store);
+    const r = st.getAll();
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+
+async function dbClear(store) {
+  const db = await getDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const st = tx.objectStore(store);
+    const r = st.clear();
+    r.onsuccess = () => resolve();
+    r.onerror = () => reject(r.error);
+  });
+}
+
+// --- INLINE WEB WORKER (STABLE HDC + HRR + k-NN + EIGENMEMORY) ---
+const hdcWorkerCode = `
+const D = 2048;
+const KNN_K = 16;
+const LSH_H = 12;
+
+// --- FFT CONTEXT ISOLATION ---
+const FFT_CONV = { r1: new Float32Array(D), i1: new Float32Array(D), r2: new Float32Array(D), i2: new Float32Array(D), rr: new Float32Array(D), ir: new Float32Array(D) };
+const FFT_CORR = { r1: new Float32Array(D), i1: new Float32Array(D), r2: new Float32Array(D), i2: new Float32Array(D), rr: new Float32Array(D), ir: new Float32Array(D) };
+
+// --- WORKER STATE ---
+const nodeMap = new Map(); // id -> { vector: Float32Array, roles: {}, text, score, timestamp }
+const knnGraph = new Map(); // id -> { neighbors: [{id, sim}], dirty: bool }
+let lastPoolIds = new Set();
+let lshHP = null;
+let lshIndex = null; // Map<hash, Set<id>>
+let eigenMemories = null;
+
+// --- UTILS ---
+function mulberry32(a) {
+  return function() {
+    var t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+}
+
+function hashString(str) {
+  let h = 0;
+  for(let i = 0; i < str.length; i++) h = Math.imul(31, h) + str.charCodeAt(i) | 0;
+  return h;
+}
+
+function tokenize(str) {
+  return str.toLowerCase().match(/\\w+(?:'\\w+)?|\\S/g) || [];
+}
+
+// --- FLOAT VECTOR PACKING (real-valued, NOT binary) ---
+function packFloat(vec) {
+  const bytes = new Uint8Array(vec.buffer);
+  let b = '';
+  for(let i = 0; i < bytes.length; i++) b += String.fromCharCode(bytes[i]);
+  return btoa(b);
+}
+
+function unpackFloat(packed) {
+  const b = atob(packed);
+  const bytes = new Uint8Array(b.length);
+  for(let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i);
+  return new Float32Array(bytes.buffer);
+}
+
+// --- TOKEN VECTORS (bipolar {-1, +1}, deterministic) ---
+const tokenCache = {};
+function getTokenVector(token) {
+  if(tokenCache[token]) return tokenCache[token];
+  const r = mulberry32(hashString(token) * 1337);
+  const v = new Float32Array(D);
+  for(let i = 0; i < D; i++) v[i] = r() > 0.5 ? 1 : -1;
+  tokenCache[token] = v;
+  return v;
+}
+
+// --- FIXED PERMUTATION ---
+const perm = new Int32Array(D);
+for(let i = 0; i < D; i++) perm[i] = i;
+const rp = mulberry32(42);
+for(let i = D - 1; i > 0; i--) {
+  const j = Math.floor(rp() * (i + 1));
+  const t = perm[i]; perm[i] = perm[j]; perm[j] = t;
+}
+
+function applyPerm(v) {
+  const o = new Float32Array(D);
+  for(let i = 0; i < D; i++) o[i] = v[perm[i]];
+  return o;
+}
+
+function shiftVector(v, pos) {
+  const o = new Float32Array(D);
+  for(let i = 0; i < D; i++) o[(i + pos) % D] = v[i];
+  return o;
+}
+
+// --- IN-PLACE FFT ---
+function fft(real, imag, inv) {
+  const n = real.length;
+  let j = 0;
+  for(let i = 1; i < n; i++) {
+    let bit = n >> 1;
+    for(; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if(i < j) {
+      let t = real[i]; real[i] = real[j]; real[j] = t;
+      t = imag[i]; imag[i] = imag[j]; imag[j] = t;
+    }
+  }
+  for(let len = 2; len <= n; len <<= 1) {
+    const ang = 2 * Math.PI / len * (inv ? -1 : 1);
+    const wc = Math.cos(ang), ws = Math.sin(ang);
+    for(let i = 0; i < n; i += len) {
+      let wr = 1, wi = 0;
+      for(let k = 0; k < len / 2; k++) {
+        const uR = real[i + k], uI = imag[i + k];
+        const vR = real[i + k + len / 2] * wr - imag[i + k + len / 2] * wi;
+        const vI = real[i + k + len / 2] * wi + imag[i + k + len / 2] * wr;
+        real[i + k] = uR + vR; imag[i + k] = uI + vI;
+        real[i + k + len / 2] = uR - vR; imag[i + k + len / 2] = uI - vI;
+        const nwr = wr * wc - wi * ws;
+        wi = wr * ws + wi * wc; wr = nwr;
+      }
+    }
+  }
+  if(inv) for(let i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; }
+}
+
+// --- CIRCULAR CONVOLUTION (isolated context) ---
+function circConv(a, b, out) {
+  const ctx = FFT_CONV;
+  ctx.r1.set(a); ctx.i1.fill(0);
+  ctx.r2.set(b); ctx.i2.fill(0);
+  fft(ctx.r1, ctx.i1, false);
+  fft(ctx.r2, ctx.i2, false);
+  for(let i = 0; i < D; i++) {
+    ctx.rr[i] = ctx.r1[i] * ctx.r2[i] - ctx.i1[i] * ctx.i2[i];
+    ctx.ir[i] = ctx.r1[i] * ctx.i2[i] + ctx.i1[i] * ctx.r2[i];
+  }
+  fft(ctx.rr, ctx.ir, true);
+  out.set(ctx.rr);
+}
+
+// --- CIRCULAR CORRELATION (isolated context) ---
+function circCorr(a, b, out) {
+  const ctx = FFT_CORR;
+  ctx.r1.set(a); ctx.i1.fill(0);
+  ctx.r2.set(b); ctx.i2.fill(0);
+  fft(ctx.r1, ctx.i1, false);
+  fft(ctx.r2, ctx.i2, false);
+  for(let i = 0; i < D; i++) {
+    ctx.rr[i] = ctx.r1[i] * ctx.r2[i] + ctx.i1[i] * ctx.i2[i];
+    ctx.ir[i] = ctx.i1[i] * ctx.r2[i] - ctx.r1[i] * ctx.i2[i];
+  }
+  fft(ctx.rr, ctx.ir, true);
+  out.set(ctx.rr);
+}
+
+// --- ROLES ---
+const ROLE_AGENT = getTokenVector("__AGENT__");
+const ROLE_PRED = getTokenVector("__PRED__");
+const ROLE_PATIENT = getTokenVector("__PATIENT__");
+const ROLE_CONTEXT = getTokenVector("__CONTEXT__");
+
+const SW = new Set(['the','a','an','is','are','was','were','be','been','being','have','has','had','do','does','did','will','would','could','should','may','might','must','shall','can','need','ought','used','to','of','in','for','on','with','at','by','from','as','into','through','during','before','after','above','below','between','under','over','again','further','then','once','here','there','when','where','why','how','all','each','few','more','most','other','some','such','no','nor','not','only','own','same','so','than','too','very','just','but','if','or','because','until','while','although','though','unless','since','about','out','up','down','off','also','any','both','either','neither','every','many','much','several','this','that','these','those','i','you','he','she','it','we','they','me','him','her','us','them','my','your','his','its','our','their','what','which','who','whom','whose','and']);
+
+function extractRoles(t) {
+  const tokens = tokenize(t);
+  let agent = null, pred = null, patient = null;
+  const used = new Set();
+  for(let i = 0; i < tokens.length; i++) if(!SW.has(tokens[i]) && tokens[i].length > 2 && /^[a-zA-Z]/.test(tokens[i])) { agent = tokens[i]; used.add(i); break; }
+  for(let i = tokens.length - 1; i >= 0; i--) if(!used.has(i) && !SW.has(tokens[i]) && tokens[i].length > 2 && /^[a-zA-Z]/.test(tokens[i])) { patient = tokens[i]; used.add(i); break; }
+  for(let i = 0; i < tokens.length; i++) if(!used.has(i) && !SW.has(tokens[i]) && tokens[i].length > 2) { pred = tokens[i]; used.add(i); break; }
+  const ctx = [];
+  for(let i = 0; i < tokens.length; i++) if(!used.has(i) && !SW.has(tokens[i]) && tokens[i].length > 1) ctx.push(tokens[i]);
+  return { agent, pred, patient, context: ctx };
+}
+
+// --- REAL-VALUED VECTORIZATION (normalized, NOT binarized) ---
+function vectorizeString(str) {
+  const tokens = tokenize(str);
+  const sum = new Float32Array(D);
+  for(let i = 0; i < tokens.length; i++) {
+    const tv = getTokenVector(tokens[i]);
+    const sh = shiftVector(tv, i % D);
+    for(let j = 0; j < D; j++) sum[j] += sh[j];
+  }
+  let norm = 0;
+  for(let j = 0; j < D; j++) norm += sum[j] * sum[j];
+  norm = Math.sqrt(norm) || 1;
+  for(let j = 0; j < D; j++) sum[j] /= norm;
+  return sum;
+}
+
+function vectorizeRoles(str) {
+  const r = extractRoles(str);
+  const res = {};
+  const tmp = new Float32Array(D);
+  if(r.agent) { circConv(ROLE_AGENT, getTokenVector(r.agent), tmp); res.agent = packFloat(new Float32Array(tmp)); }
+  if(r.pred) { circConv(ROLE_PRED, getTokenVector(r.pred), tmp); res.pred = packFloat(new Float32Array(tmp)); }
+  if(r.patient) { circConv(ROLE_PATIENT, getTokenVector(r.patient), tmp); res.patient = packFloat(new Float32Array(tmp)); }
+  if(r.context.length) {
+    tmp.fill(0);
+    const ctxTmp = new Float32Array(D);
+    for(const c of r.context) { circConv(ROLE_CONTEXT, getTokenVector(c), ctxTmp); for(let j = 0; j < D; j++) tmp[j] += ctxTmp[j]; }
+    let norm = 0; for(let j = 0; j < D; j++) norm += tmp[j] * tmp[j];
+    norm = Math.sqrt(norm) || 1; for(let j = 0; j < D; j++) tmp[j] /= norm;
+    res.context = packFloat(new Float32Array(tmp));
+  }
+  return res;
+}
+
+// --- SIMILARITY (cosine on real vectors) ---
+function cosineReal(a, b) {
+  let dot = 0, n1 = 0, n2 = 0;
+  for(let i = 0; i < D; i++) { dot += a[i] * b[i]; n1 += a[i] * a[i]; n2 += b[i] * b[i]; }
+  return dot / (Math.sqrt(n1 * n2) || 1);
+}
+
+function dotReal(a, b) {
+  let d = 0;
+  for(let i = 0; i < D; i++) d += a[i] * b[i];
+  return d;
+}
+
+// --- CLEANUP MEMORY ---
+function cleanup(unbound, cands) {
+  let best = null, bestSc = -Infinity;
+  for(const t of cands) {
+    const tv = getTokenVector(t);
+    const s = dotReal(unbound, tv);
+    if(s > bestSc) { bestSc = s; best = t; }
+  }
+  return { token: best, sim: bestSc };
+}
+
+// --- EIGENMEMORY (OJA) ---
+const EIGEN_K = 32;
+
+function initEigen() {
+  if(eigenMemories) return;
+  eigenMemories = [];
+  const r = mulberry32(777);
+  for(let k = 0; k < EIGEN_K; k++) {
+    const v = new Float32Array(D);
+    for(let i = 0; i < D; i++) v[i] = r() > 0.5 ? 1 : -1;
+    let n = 0; for(let i = 0; i < D; i++) n += v[i] * v[i];
+    n = Math.sqrt(n); for(let i = 0; i < D; i++) v[i] /= n;
+    eigenMemories.push(v);
+  }
+}
+
+function ojaUpdate(vec, lr=0.002) {
+  initEigen();
+  for(let k = 0; k < EIGEN_K; k++) {
+    const e = eigenMemories[k];
+    let proj = 0; for(let i = 0; i < D; i++) proj += vec[i] * e[i];
+    for(let i = 0; i < D; i++) e[i] += lr * (vec[i] * proj - e[i] * proj * proj);
+    let n = 0; for(let i = 0; i < D; i++) n += e[i] * e[i];
+    n = Math.sqrt(n); if(n > 0) for(let i = 0; i < D; i++) e[i] /= n;
+  }
+}
+
+function computeEcho(vec) {
+  initEigen();
+  const out = new Float32Array(D);
+  for(let k = 0; k < EIGEN_K; k++) {
+    const e = eigenMemories[k];
+    let p = 0; for(let i = 0; i < D; i++) p += vec[i] * e[i];
+    for(let i = 0; i < D; i++) out[i] += p * e[i];
+  }
+  let n = 0; for(let i = 0; i < D; i++) n += out[i] * out[i];
+  n = Math.sqrt(n) || 1; for(let i = 0; i < D; i++) out[i] /= n;
+  return out;
+}
+
+// --- LSH ---
+function initLSH() {
+  if(lshHP) return;
+  lshHP = [];
+  const r = mulberry32(999);
+  for(let h = 0; h < LSH_H; h++) {
+    const hp = new Float32Array(D);
+    for(let i = 0; i < D; i++) hp[i] = r() > 0.5 ? 1 : -1;
+    lshHP.push(hp);
+  }
+}
+
+function lshHashReal(vec) {
+  let h = 0;
+  for(let b = 0; b < LSH_H; b++) {
+    let d = 0; for(let i = 0; i < D; i++) d += vec[i] * lshHP[b][i];
+    if(d > 0) h |= (1 << b);
+  }
+  return h;
+}
+
+function buildLSH() {
+  initLSH();
+  lshIndex = new Map();
+  for(const [id, n] of nodeMap) {
+    const h = lshHashReal(n.vector);
+    if(!lshIndex.has(h)) lshIndex.set(h, new Set());
+    lshIndex.get(h).add(id);
+  }
+}
+
+function lshCandidateIds(vec, excludeId) {
+  if(!lshIndex) buildLSH();
+  const h = lshHashReal(vec);
+  const cands = new Set();
+  const own = lshIndex.get(h);
+  if(own) for(const id of own) if(id !== excludeId) cands.add(id);
+  for(let b = 0; b < LSH_H; b++) {
+    const bucket = lshIndex.get(h ^ (1 << b));
+    if(bucket) for(const id of bucket) if(id !== excludeId) cands.add(id);
+  }
+  for(let b1 = 0; b1 < LSH_H; b1++) {
+    for(let b2 = b1 + 1; b2 < LSH_H; b2++) {
+      const bucket = lshIndex.get(h ^ (1 << b1) ^ (1 << b2));
+      if(bucket) for(const id of bucket) if(id !== excludeId) cands.add(id);
+    }
+  }
+  return cands;
+}
+
+// --- INCREMENTAL k-NN GRAPH ---
+function syncPool(pool) {
+  const currIds = new Set(pool.map(n => n.id));
+  // Remove dead
+  for(const id of lastPoolIds) {
+    if(!currIds.has(id)) {
+      nodeMap.delete(id);
+      knnGraph.delete(id);
+      for(const [_, meta] of knnGraph) meta.neighbors = meta.neighbors.filter(n => n.id !== id);
+    }
+  }
+  // Add new
+  const newIds = [];
+  for(const n of pool) {
+    if(!nodeMap.has(n.id)) {
+      const vec = unpackFloat(n.vector);
+      const roles = {};
+      if(n.roleAgent) roles.agent = unpackFloat(n.roleAgent);
+      if(n.rolePred) roles.pred = unpackFloat(n.rolePred);
+      if(n.rolePatient) roles.patient = unpackFloat(n.rolePatient);
+      if(n.roleContext) roles.context = unpackFloat(n.roleContext);
+      nodeMap.set(n.id, { vector: vec, roles, text: n.text, score: n.score || 1, timestamp: n.timestamp });
+      knnGraph.set(n.id, { neighbors: [], dirty: true });
+      newIds.push(n.id);
+    }
+  }
+  lastPoolIds = currIds;
+  if(newIds.length > 0) buildLSH();
+
+  // Update dirty nodes and bidirectional edges
+  for(const nid of newIds) {
+    const vec = nodeMap.get(nid).vector;
+    const candSet = lshCandidateIds(vec, nid);
+    const neighbors = [];
+    for(const cid of candSet) {
+      const sim = cosineReal(vec, nodeMap.get(cid).vector);
+      if(sim > 0.01) neighbors.push({ id: cid, sim });
+    }
+    neighbors.sort((a, b) => b.sim - a.sim);
+    const top = neighbors.slice(0, KNN_K);
+    knnGraph.get(nid).neighbors = top;
+    knnGraph.get(nid).dirty = false;
+
+    for(const nb of top) {
+      const other = knnGraph.get(nb.id);
+      const ex = other.neighbors.find(x => x.id === nid);
+      if(ex) ex.sim = nb.sim;
+      else {
+        other.neighbors.push({ id: nid, sim: nb.sim });
+        other.neighbors.sort((a, b) => b.sim - a.sim);
+        if(other.neighbors.length > KNN_K) other.neighbors.pop();
+      }
+    }
+  }
+}
+
+// --- MESSAGE HANDLER ---
+self.onmessage = function(e) {
+  const { type, payload, id, pool, config } = e.data;
+
+  if(type === 'VECTORIZE') {
+    const vec = vectorizeString(payload);
+    const roles = vectorizeRoles(payload);
+    self.postMessage({ id, result: { vector: packFloat(vec), agent: roles.agent, pred: roles.pred, patient: roles.patient, context: roles.context } });
+  }
+  else if(type === 'GENERATE') {
+    syncPool(pool);
+    const qVec = vectorizeString(payload);
+    const qRoles = vectorizeRoles(payload);
+    const qEcho = computeEcho(qVec);
+    if(nodeMap.size === 0) { self.postMessage({ id, result: { text: "", usedIds: [] } }); return; }
+
+    const gw = config.graphWeight != null ? config.graphWeight : 0.3;
+    const ew = config.echoWeight != null ? config.echoWeight : 0.15;
+    const temp = Math.max(0.01, config.samplingTemp != null ? config.samplingTemp : 0.6);
+
+    // Candidate generation: LSH + random sample to prevent bucket collapse
+    const lshSet = lshCandidateIds(qVec, null);
+    const allIds = Array.from(nodeMap.keys());
+    const randSet = new Set();
+    while(randSet.size < Math.min(20, allIds.length)) randSet.add(allIds[Math.floor(Math.random() * allIds.length)]);
+    const candIds = new Set([...lshSet, ...randSet]);
+    const cands = Array.from(candIds).map(cid => ({ id: cid, ...nodeMap.get(cid) }));
+
+    const scored = cands.map(n => {
+      const simContent = cosineReal(qVec, n.vector);
+      let structSim = 0, structCnt = 0;
+      if(n.roles?.agent && qRoles.agent) { structSim += cosineReal(n.roles.agent, qRoles.agent); structCnt++; }
+      if(n.roles?.pred && qRoles.pred) { structSim += cosineReal(n.roles.pred, qRoles.pred); structCnt++; }
+      if(n.roles?.patient && qRoles.patient) { structSim += cosineReal(n.roles.patient, qRoles.patient); structCnt++; }
+      if(n.roles?.context && qRoles.context) { structSim += cosineReal(n.roles.context, qRoles.context); structCnt++; }
+      const ns = structCnt > 0 ? structSim / structCnt : 0;
+      const echoSim = cosineReal(qEcho, n.vector);
+      return { ...n, sim: (1 - gw - ew) * simContent + gw * ns + ew * echoSim };
+    });
+
+    const sims = scored.map(n => n.sim);
+    const maxSim = Math.max(...sims);
+    let sumExp = 0;
+    const exps = sims.map(s => { const e = Math.exp((s - maxSim) / temp); sumExp += e; return e; });
+    const probs = exps.map(e => e / sumExp);
+
+    const sampleSize = Math.min(config.topK, scored.length);
+    const selIdx = [];
+    while(selIdx.length < sampleSize) {
+      let r = Math.random(), cum = 0, ch = -1;
+      for(let i = 0; i < scored.length; i++) {
+        if(selIdx.includes(i)) continue;
+        cum += probs[i];
+        if(r <= cum) { ch = i; break; }
+      }
+      if(ch !== -1) selIdx.push(ch); else break;
+    }
+    let topPool = selIdx.map(i => scored[i]);
+
+    // MMR diversification
+    const lambda = config.diversityLambda != null ? config.diversityLambda : 0.5;
+    const selected = [];
+    for(let i = 0; i < Math.min(topPool.length, 3); i++) {
+      let bestIdx = -1, bestScore = -Infinity;
+      for(let j = 0; j < topPool.length; j++) {
+        if(selected.includes(j)) continue;
+        let s1 = topPool[j].sim, maxS2 = 0;
+        for(const sel of selected) {
+          const s = cosineReal(topPool[j].vector, topPool[sel].vector);
+          if(s > maxS2) maxS2 = s;
+        }
+        const mmr = lambda * s1 - (1 - lambda) * maxS2;
+        if(mmr > bestScore) { bestScore = mmr; bestIdx = j; }
+      }
+      if(bestIdx !== -1) selected.push(bestIdx);
+    }
+
+    // Coherence-guarded assembly
+    const primary = topPool[selected];
+    let text = primary.text;
+    let usedIds = [primary.id];
+
+    if(selected.length > 1) {
+      const pToks = new Set(tokenize(primary.text));
+      const related = [];
+      for(let k = 1; k < selected.length; k++) {
+        const sec = topPool[selected[k]];
+        if(cosineReal(primary.vector, sec.vector) < 0.35) continue;
+        const secToks = tokenize(sec.text);
+        const overlap = secToks.filter(t => pToks.has(t) && !SW.has(t) && t.length > 2).length > 0;
+        if(!overlap) continue;
+        related.push(sec.text);
+        usedIds.push(sec.id);
+      }
+      if(related.length > 0) text = [primary.text, ...related].join(" | ");
+    }
+
+    // Strong validation
+    const toks = tokenize(text);
+    const content = toks.filter(t => !SW.has(t) && t.length > 2);
+    const counts = {};
+    for(const t of toks) counts[t] = (counts[t] || 0) + 1;
+    const maxFreq = Math.max(0, ...Object.values(counts));
+    const valid = toks.length >= 4 && content.length >= 3 && (maxFreq / toks.length) <= 0.3;
+    if(!valid) { text = primary.text; usedIds = [primary.id]; }
+
+    self.postMessage({ id, result: { text, usedIds } });
+  }
+  else if(type === 'EVALUATE') {
+    syncPool(pool);
+    const cVec = unpackFloat(payload);
+    let maxSim = -Infinity;
+    for(const [_, n] of nodeMap) {
+      const s = cosineReal(cVec, n.vector);
+      if(s > maxSim) maxSim = s;
+    }
+    self.postMessage({ id, result: maxSim });
+  }
+  else if(type === 'CROSSOVER') {
+    const { p1Text, p2Text, rescue } = e.data;
+    const r1 = extractRoles(p1Text), r2 = extractRoles(p2Text);
+    const allToks = [...new Set([...tokenize(p1Text), ...tokenize(p2Text)])].filter(t => t.length > 0);
+    const parts = [];
+    const outBuf = new Float32Array(D);
+
+    for(const role of ['agent','pred','patient']) {
+      const rvec = role === 'agent' ? ROLE_AGENT : role === 'pred' ? ROLE_PRED : ROLE_PATIENT;
+      if(r1[role] && r2[role]) {
+        const v1 = getTokenVector(r1[role]);
+        const v2 = getTokenVector(r2[role]);
+        for(let j = 0; j < D; j++) outBuf[j] = v1[j] + v2[j];
+        circCorr(outBuf, rvec, outBuf);
+        const c = cleanup(outBuf, allToks);
+        if(c.token) parts.push(c.token);
+      } else if(r1[role] || r2[role]) {
+        const src = getTokenVector(r1[role] || r2[role]);
+        circCorr(src, rvec, outBuf);
+        const c = cleanup(outBuf, allToks);
+        if(c.token) parts.push(c.token);
+      }
+    }
+
+    if(r1.context.length || r2.context.length) {
+      outBuf.fill(0);
+      const tmp = new Float32Array(D);
+      for(const c of r1.context) { circConv(ROLE_CONTEXT, getTokenVector(c), tmp); for(let j=0;j<D;j++) outBuf[j]+=tmp[j]; }
+      for(const c of r2.context) { circConv(ROLE_CONTEXT, getTokenVector(c), tmp); for(let j=0;j<D;j++) outBuf[j]+=tmp[j]; }
+      circCorr(outBuf, ROLE_CONTEXT, outBuf);
+      const remain = allToks.filter(t => !parts.includes(t));
+      const scored = remain.map(t => ({ t, s: dotReal(outBuf, getTokenVector(t)) }));
+      scored.sort((a,b) => b.s - a.s);
+      for(const c of scored.slice(0, rescue ? 5 : 3)) parts.push(c.t);
+    }
+
+    const text = parts.join(" ");
+    self.postMessage({ id, result: { text, confidence: parts.length > 2 ? 1 : 0 } });
+  }
+  else if(type === 'FITNESS') {
+    const { candidateVec, candidateText } = e.data;
+    syncPool(pool);
+    const cVec = unpackFloat(candidateVec);
+
+    // Attractor penalty: avg sim to top-5 LSH neighbors of candidate
+    const candHash = lshHashReal(cVec);
+    const bucket = lshIndex ? lshIndex.get(candHash) : null;
+    let penalty = 0, pCnt = 0;
+    if(bucket) {
+      const arr = Array.from(bucket).slice(0, 5);
+      for(const nid of arr) {
+        const n = nodeMap.get(nid);
+        if(n) { penalty += cosineReal(cVec, n.vector); pCnt++; }
+      }
+    }
+    penalty = pCnt > 0 ? (penalty / pCnt) * 0.4 : 0;
+
+    const probes = [candidateText];
+    const toks = tokenize(candidateText);
+    if(toks.length > 2) {
+      probes.push(toks.slice(0, Math.ceil(toks.length/2)).join(" "));
+      probes.push([...toks].sort(()=>Math.random()-0.5).join(" "));
+    }
+    let totalRank = 0;
+    for(const probe of probes) {
+      const qv = vectorizeString(probe);
+      const childSim = cosineReal(qv, cVec);
+      // Rank against random sample of 40 nodes (sub-quadratic)
+      const sample = [];
+      const ids = Array.from(nodeMap.keys());
+      while(sample.length < Math.min(40, ids.length)) {
+        const rid = ids[Math.floor(Math.random()*ids.length)];
+        if(!sample.includes(rid)) sample.push(rid);
+      }
+      let rank = 0;
+      for(const sid of sample) {
+        if(cosineReal(qv, nodeMap.get(sid).vector) > childSim) rank++;
+      }
+      totalRank += rank;
+    }
+    const avgRank = totalRank / probes.length;
+    const rawFitness = Math.max(0, 1 - avgRank / (Math.min(40, nodeMap.size) || 1));
+    const fitness = Math.max(0, rawFitness - penalty);
+    self.postMessage({ id, result: fitness });
+  }
+  else if(type === 'ENTROPY') {
+    syncPool(pool);
+    let total = 0, cnt = 0;
+    for(const [_, meta] of knnGraph) {
+      if(meta.neighbors.length > 0) { total += meta.neighbors.sim; cnt++; }
+    }
+    const avgMax = cnt > 0 ? total / cnt : 0;
+    self.postMessage({ id, result: avgMax });
+  }
+  else if(type === 'DISTANT_PARENT') {
+    const { nodeId } = e.data;
+    syncPool(pool);
+    const meta = knnGraph.get(nodeId);
+    let chosen = null;
+    if(meta && meta.neighbors.length > 0) {
+      // Least similar neighbor = distant parent
+      chosen = meta.neighbors[meta.neighbors.length - 1].id;
+    } else {
+      const ids = Array.from(nodeMap.keys());
+      chosen = ids[Math.floor(Math.random() * ids.length)];
+    }
+    self.postMessage({ id, result: chosen });
+  }
+  else if(type === 'EIGEN_UPDATE') {
+    ojaUpdate(unpackFloat(e.data.vector));
+    self.postMessage({ id, result: true });
+  }
+  else if(type === 'EIGEN_SERIALIZE') {
+    initEigen();
+    self.postMessage({ id, result: eigenMemories.map(e => Array.from(e)) });
+  }
+  else if(type === 'EIGEN_LOAD') {
+    const v = e.data.vectors;
+    eigenMemories = v.map(arr => { const f = new Float32Array(D); f.set(arr); return f; });
+    self.postMessage({ id, result: true });
+  }
+  else if(type === 'DECAY') {
+    const rate = e.data.rate || 0.98;
+    const updated = pool.map(n => ({ id: n.id, score: (n.score || 1) * rate }));
+    self.postMessage({ id, result: updated });
+  }
+  else if(type === 'PRUNE') {
+    const maxNodes = e.data.maxNodes || 120;
+    syncPool(pool);
+    if(nodeMap.size <= maxNodes) {
+      self.postMessage({ id, result: { toRemove: [], avgRedundancy: 0 } });
+      return;
+    }
+    // Rank-normalize scores
+    const entries = Array.from(nodeMap.entries()).map(([id, n]) => ({ id, ...n }));
+    entries.sort((a, b) => (b.score || 1) - (a.score || 1));
+    entries.forEach((n, i) => { n.rankNormScore = (n.score || 1) / Math.log2(i + 2); });
+
+    const red = new Float32Array(entries.length);
+    for(let i = 0; i < entries.length; i++) {
+      const meta = knnGraph.get(entries[i].id);
+      red[i] = meta && meta.neighbors.length > 0 ? meta.neighbors.sim : 0;
+    }
+    const indexed = entries.map((n, i) => ({ id: n.id, utility: (n.rankNormScore || 1) / (1 + red[i]) }));
+    indexed.sort((a, b) => a.utility - b.utility);
+    const toRemove = indexed.slice(0, entries.length - maxNodes).map(x => x.id);
+    for(const rid of toRemove) {
+      nodeMap.delete(rid);
+      knnGraph.delete(rid);
+      for(const [_, meta] of knnGraph) meta.neighbors = meta.neighbors.filter(x => x.id !== rid);
+    }
+    const avgRed = red.reduce((a, b) => a + b, 0) / red.length;
+    self.postMessage({ id, result: { toRemove, avgRedundancy: avgRed } });
+  }
+  else if(type === 'CLEAR_CACHE') {
+    nodeMap.clear();
+    knnGraph.clear();
+    lastPoolIds.clear();
+    lshHP = null; lshIndex = null;
+    eigenMemories = null;
+    self.postMessage({ id, result: true });
+  }
+};
+`;
+const workerBlob = new Blob([hdcWorkerCode], { type: 'application/javascript' });
+const workerUrl = URL.createObjectURL(workerBlob);
+
+// --- MAIN APP COMPONENT ---
+function App() {
+  const [logs, setLogs] = useState([]);
+  const [chat, setChat] = useState([{role:'system', text:'Stable memory awaiting bootstrap...'}]);
+  const [prompt, setPrompt] = useState("");
+  const [isEvolutionActive, setIsEvolutionActive] = useState(false);
+  const [telemetry, setTelemetry] = useState({ nodes:0, evolutionGen:0, entropy:0, rescue:false });
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
+  const [config, setConfig] = useState({
+    samplingTemp: 0.6, diversityLambda: 0.5, topK: 5,
+    evolutionRate: 4000, maxMemory: 120,
+    noveltyThreshold: 0.85, decayRate: 0.98,
+    graphWeight: 0.3, echoWeight: 0.15,
+    fitnessThreshold: 0.25
+  });
+
+  const memoryBank = useRef([]);
+  const nodeMapRef = useRef(new Map());
+  const isGenerating = useRef(false);
+  const evolutionTimer = useRef(null);
+  const hdcWorker = useRef(null);
+  const pendingPromises = useRef({});
+  const entropyHistory = useRef([]);
+  const rescueMode = useRef(false);
+  const generationCount = useRef(0);
+
+  const addLog = useCallback((msg) => {
+    const t = new Date().toLocaleTimeString('en-US',{hour12:false});
+    setLogs(prev => [`[${t}] ${msg}`, ...prev].slice(0,100));
+  }, []);
+
+  useEffect(() => {
+    hdcWorker.current = new Worker(workerUrl);
+    hdcWorker.current.onmessage = (e) => {
+      const { id, result } = e.data;
+      if(pendingPromises.current[id]) {
+        pendingPromises.current[id].resolve(result);
+        delete pendingPromises.current[id];
+      }
+    };
+    return () => hdcWorker.current.terminate();
+  }, []);
+
+  const askWorker = useCallback((type, payload, extra={}) => {
+    return new Promise((resolve, reject) => {
+      const id = Math.random().toString(36).substr(2,9);
+      pendingPromises.current[id] = { resolve, reject };
+      hdcWorker.current.postMessage({ type, payload, id, ...extra });
+    });
+  }, []);
+
+  // Load from IndexedDB
+  useEffect(() => {
+    async function init() {
+      try {
+        const nodes = await dbGetAll('nodes');
+        memoryBank.current = nodes;
+        const m = new Map(); for(const n of nodes) m.set(n.id, n);
+        nodeMapRef.current = m;
+        const meta = await dbGetAll('meta');
+        const eigenMeta = meta.find(m => m.key === 'eigen');
+        if(eigenMeta && eigenMeta.vectors) await askWorker('EIGEN_LOAD', null, { vectors: eigenMeta.vectors });
+        const cfg = meta.find(m => m.key === 'config');
+        if(cfg && cfg.value) setConfig(prev => ({ ...prev, ...cfg.value }));
+        const gen = meta.find(m => m.key === 'generation');
+        if(gen) generationCount.current = gen.value || 0;
+        setTelemetry(prev => ({ ...prev, nodes: nodes.length }));
+        addLog(`[SYSTEM] Loaded ${nodes.length} shards. k-NN graph ready.`);
+      } catch(e) {
+        addLog(`[ERROR] Storage init: ${e.message}`);
+      }
+    }
+    init();
+  }, [addLog, askWorker]);
+
+  // Evolution loop
+  useEffect(() => {
+    if(isEvolutionActive) evolutionTimer.current = setInterval(evolve, config.evolutionRate);
+    else if(evolutionTimer.current) clearInterval(evolutionTimer.current);
+    return () => clearInterval(evolutionTimer.current);
+  }, [isEvolutionActive, config.evolutionRate]);
+
+  const saveNode = async (node) => {
+    await dbPut('nodes', node);
+  };
+
+  const deleteNode = async (id) => {
+    await dbDelete('nodes', id);
+  };
+
+  const evolve = async () => {
+    if(memoryBank.current.length < 5) return;
+    generationCount.current++;
+    setTelemetry(prev => ({ ...prev, evolutionGen: generationCount.current }));
+
+    // 1. Decay
+    const decayed = await askWorker('DECAY', null, { pool: memoryBank.current, rate: rescueMode.current ? 0.85 : config.decayRate });
+    for(const d of decayed) {
+      const n = nodeMapRef.current.get(d.id);
+      if(n) { n.score = d.score; await saveNode(n); }
+    }
+
+    // 2. Entropy check
+    const entropy = await askWorker('ENTROPY', null, { pool: memoryBank.current });
+    entropyHistory.current.push(entropy);
+    if(entropyHistory.current.length > 5) entropyHistory.current.shift();
+    const avgEnt = entropyHistory.current.slice(-3).reduce((a,b)=>a+b,0)/3;
+
+    if(avgEnt > 0.65 && !rescueMode.current) {
+      rescueMode.current = true;
+      addLog(`[RESCUE] Entropy ${avgEnt.toFixed(3)}. Activating distant-parent mode.`);
+      setTelemetry(prev => ({ ...prev, rescue: true }));
+    } else if(avgEnt < 0.55 && rescueMode.current) {
+      rescueMode.current = false;
+      addLog(`[RESCUE] Entropy normalized ${avgEnt.toFixed(3)}.`);
+      setTelemetry(prev => ({ ...prev, rescue: false }));
+    }
+    setTelemetry(prev => ({ ...prev, entropy: entropy.toFixed(3) }));
+
+    // 3. Parent selection (distant in rescue mode)
+    const pool = memoryBank.current;
+    const idxA = Math.floor(Math.random() * pool.length);
+    let idxB;
+    if(rescueMode.current && pool.length > 20) {
+      const distantId = await askWorker('DISTANT_PARENT', null, { nodeId: pool[idxA].id, pool });
+      idxB = pool.findIndex(n => n.id === distantId);
+      if(idxB === -1 || idxB === idxA) {
+        idxB = Math.floor(Math.random() * pool.length);
+        while(idxB === idxA) idxB = Math.floor(Math.random() * pool.length);
+      }
+    } else {
+      idxB = Math.floor(Math.random() * pool.length);
+      while(idxB === idxA) idxB = Math.floor(Math.random() * pool.length);
+    }
+
+    // 4. Crossover
+    const vecChild = await askWorker('CROSSOVER', null, { p1Text: pool[idxA].text, p2Text: pool[idxB].text, rescue: rescueMode.current });
+    let childText = vecChild.text;
+    if(!childText || childText.length < 5 || vecChild.confidence < 0.3) {
+      const tA = pool[idxA].text.split(/\\s+/);
+      const tB = pool[idxB].text.split(/\\s+/);
+      const pA = Math.floor(Math.random() * (tA.length-1)) + 1;
+      const pB = Math.floor(Math.random() * (tB.length-1)) + 1;
+      childText = [...tA.slice(0,pA), ...tB.slice(pB)].join(" ");
+    }
+
+    // 5. Vectorize (real-valued)
+    const packed = await askWorker('VECTORIZE', childText);
+
+    // 6. Fitness & Novelty
+    const rawFitness = await askWorker('FITNESS', null, { candidateVec: packed.vector, candidateText: childText, pool: memoryBank.current });
+    const maxSim = await askWorker('EVALUATE', null, { candidate: packed.vector, pool: memoryBank.current });
+
+    // 7. Probabilistic acceptance gate (sigmoid)
+    const a = 6.0, b = 8.0, c = 2.0;
+    const entPenalty = Math.max(0, avgEnt - 0.5);
+    const rescueBonus = rescueMode.current ? 2.0 : 0;
+    const z = a * rawFitness - b * maxSim - c * entPenalty + rescueBonus;
+    const prob = 1 / (1 + Math.exp(-z));
+    const accepted = Math.random() < prob;
+
+    if(accepted) {
+      const id = 'node_' + Date.now() + '_' + Math.random().toString(36).substr(2,5);
+      const newNode = {
+        id, text: childText, vector: packed.vector,
+        roleAgent: packed.agent, rolePred: packed.pred,
+        rolePatient: packed.patient, roleContext: packed.context,
+        timestamp: Date.now(), type: 'evolved',
+        score: 1.0 + rawFitness,
+        birthGen: generationCount.current
+      };
+      memoryBank.current.push(newNode);
+      nodeMapRef.current.set(id, newNode);
+      await saveNode(newNode);
+      setTelemetry(prev => ({ ...prev, nodes: memoryBank.current.length }));
+
+      await askWorker('EIGEN_UPDATE', null, { vector: packed.vector });
+      if(generationCount.current % 5 === 0) {
+        const eigenSer = await askWorker('EIGEN_SERIALIZE', null, {});
+        await dbPut('meta', { key: 'eigen', vectors: eigenSer });
+      }
+
+      // 8. Lazy prune with k-NN graph
+      const watermark = Math.floor(config.maxMemory * 1.25);
+      if(memoryBank.current.length > watermark) {
+        const pruneRes = await askWorker('PRUNE', null, { pool: memoryBank.current, maxNodes: config.maxMemory });
+        const { toRemove, avgRedundancy } = pruneRes;
+        if(toRemove.length > 0) {
+          for(const rid of toRemove) {
+            await deleteNode(rid);
+            memoryBank.current = memoryBank.current.filter(n => n.id !== rid);
+            nodeMapRef.current.delete(rid);
+          }
+          const newGate = Math.min(0.94, avgRedundancy + 0.08);
+          setConfig(prev => ({ ...prev, noveltyThreshold: newGate }));
+          addLog(`[SYSTEM] Pruned ${toRemove.length}. Red: ${avgRedundancy.toFixed(3)} | Gate: ${newGate.toFixed(3)} | Fit: ${rawFitness.toFixed(3)} | Prob: ${prob.toFixed(3)} | Ent: ${avgEnt.toFixed(3)}`);
+          setTelemetry(prev => ({ ...prev, nodes: memoryBank.current.length }));
+        }
+      }
+    } else {
+      addLog(`[EVOLVE] Rejected. Fit: ${rawFitness.toFixed(3)} | Nov: ${maxSim.toFixed(3)} | Prob: ${prob.toFixed(3)} | Ent: ${avgEnt.toFixed(3)}`);
+    }
+
+    await dbPut('meta', { key: 'config', value: { ...config, noveltyThreshold: config.noveltyThreshold } });
+    await dbPut('meta', { key: 'generation', value: generationCount.current });
+  };
+
+  const triggerBootstrap = async () => {
+    addLog("[SYSTEM] Sowing stable seeds...");
+    const seeds = [
+      "Entropy is the arrow time follows.",
+      "Information decays into structure.",
+      "Consciousness is a recursive boundary condition.",
+      "Meaning emerges from constrained randomness.",
+      "The universe computes its own existence.",
+      "Memory is the gravity of thought.",
+      "Every system contains the ghost of its observer.",
+      "Chaos and order are conjugate variables.",
+      "Reality is the stable fixed point of perception.",
+      "Syntax is the fossil of intention."
+    ];
+    for(const shard of seeds) {
+      const packed = await askWorker('VECTORIZE', shard);
+      const id = 'seed_' + Date.now() + '_' + Math.random().toString(36).substr(2,5);
+      const node = {
+        id, text: shard, vector: packed.vector,
+        roleAgent: packed.agent, rolePred: packed.pred,
+        rolePatient: packed.patient, roleContext: packed.context,
+        timestamp: Date.now(), type: 'seed', score: 1.0, birthGen: 0
+      };
+      memoryBank.current.push(node);
+      nodeMapRef.current.set(id, node);
+      await saveNode(node);
+    }
+    addLog("[SYSTEM] Seeds sown. Evolution active.");
+    setIsEvolutionActive(true);
+    setTelemetry(prev => ({ ...prev, nodes: memoryBank.current.length }));
+  };
+
+  const generateResponse = async (queryText) => {
+    return await askWorker('GENERATE', queryText, { pool: memoryBank.current, config });
+  };
+
+  const exportModel = async () => {
+    addLog("[SYSTEM] Exporting stable brain...");
+    const nodes = await dbGetAll('nodes');
+    const meta = await dbGetAll('meta');
+    const eigenMeta = meta.find(m => m.key === 'eigen');
+    const model = {
+      manifest: { name: "Neural Anarchy Stable", architecture: "HDC+HRR+Eigenmemory+kNN", dimension: 2048, generated_at: new Date().toISOString(), node_count: nodes.length },
+      runtime_engine: { logic: hdcWorkerCode.trim() },
+      config,
+      eigenmemory: eigenMeta ? eigenMeta.vectors : null,
+      weights: nodes.map(n => ({ t: n.text, v: n.vector, ra: n.roleAgent, rp: n.rolePred, rt: n.rolePatient, rc: n.roleContext, s: n.score || 1 }))
+    };
+    const blob = new Blob([JSON.stringify(model, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `stable_brain_${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    addLog("[SYSTEM] Export complete.");
+  };
+
+  const importModel = async (file) => {
+    const text = await file.text();
+    const model = JSON.parse(text);
+    if(!model.weights) { addLog("[ERROR] Invalid brain file."); return; }
+    await wipeMemory(false);
+    for(const w of model.weights) {
+      const id = 'imp_' + Date.now() + '_' + Math.random().toString(36).substr(2,5);
+      const node = { id, text: w.t, vector: w.v, roleAgent: w.ra, rolePred: w.rp, rolePatient: w.rt, roleContext: w.rc, score: w.s || 1, timestamp: Date.now(), type: 'imported', birthGen: 0 };
+      memoryBank.current.push(node);
+      nodeMapRef.current.set(id, node);
+      await saveNode(node);
+    }
+    if(model.eigenmemory) {
+      await askWorker('EIGEN_LOAD', null, { vectors: model.eigenmemory });
+      await dbPut('meta', { key: 'eigen', vectors: model.eigenmemory });
+    }
+    setTelemetry(prev => ({ ...prev, nodes: memoryBank.current.length }));
+    addLog(`[SYSTEM] Imported ${model.weights.length} nodes.`);
+  };
+
+  const wipeMemory = async (log=true) => {
+    setIsEvolutionActive(false);
+    await dbClear('nodes');
+    await dbClear('meta');
+    await askWorker('CLEAR_CACHE');
+    memoryBank.current = [];
+    nodeMapRef.current = new Map();
+    entropyHistory.current = [];
+    rescueMode.current = false;
+    generationCount.current = 0;
+    if(log) addLog("Field Purged.");
+    setTelemetry({ nodes:0, evolutionGen:0, entropy:0, rescue:false });
+  };
+
+  const handleExecute = async () => {
+    if(!prompt.trim() || isGenerating.current) return;
+    const p = prompt; setPrompt("");
+    setChat(prev => [...prev, {role:'user', text:p}]);
+    isGenerating.current = true;
+    const resObj = await generateResponse(p);
+    let text = resObj.text || "Latency silent.";
+
+    if(resObj.usedIds && resObj.usedIds.length > 0) {
+      for(const uid of resObj.usedIds) {
+        const n = nodeMapRef.current.get(uid);
+        if(n) {
+          n.score = (n.score || 1) + 0.25;
+          await saveNode(n);
+        }
+      }
+    }
+
+    setChat(prev => [...prev, {role:'system', text}]);
+    isGenerating.current = false;
+  };
+
+  return (
+    <div className="h-screen flex flex-col relative text-slate-300">
+      <header className="glass-panel p-4 flex justify-between items-center shadow-lg border-b border-cyan-500/10">
+        <div className="flex items-center gap-4">
+          <div className={`w-3 h-3 rounded-full ${isEvolutionActive ? 'bg-cyan-400 glow-pulse' : 'bg-slate-700'}`}></div>
+          <h1 className="text-xl font-black tracking-tighter italic text-cyan-400">CANCELED_FRONTIER <span className="text-[10px] font-normal text-slate-500 ml-2">V8.0_STABLE</span></h1>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={triggerBootstrap} className="bg-white text-black px-4 py-2 rounded text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all">Bootstrap</button>
+          <button onClick={exportModel} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded text-[10px] uppercase font-bold transition-all">Export</button>
+          <label className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded text-[10px] uppercase font-bold transition-all cursor-pointer">
+            Import
+            <input type="file" accept=".json" className="hidden" onChange={e => { if(e.target.files) importModel(e.target.files); e.target.value=''; }} />
+          </label>
+          <button onClick={() => setIsModalOpen(true)} className="bg-slate-800 px-3 py-2 rounded text-[10px] uppercase font-bold">Field View</button>
+        </div>
+      </header>
+
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 overflow-hidden">
+        <section className="flex flex-col gap-4">
+          <div className="glass-panel rounded-xl p-5 flex flex-col flex-1">
+            <h2 className="text-[10px] font-black uppercase mb-4 gemini-gradient">Controller</h2>
+            <div className="space-y-5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono text-slate-400">Evolution</span>
+                <button onClick={() => setIsEvolutionActive(!isEvolutionActive)} className={`w-10 h-5 rounded-full relative transition-all ${isEvolutionActive ? 'bg-cyan-500' : 'bg-slate-800'}`}>
+                  <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${isEvolutionActive ? 'left-6' : 'left-1'}`}></div>
+                </button>
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Sample Temp</span><span>{config.samplingTemp}</span></div>
+                <input type="range" min="0.05" max="1" step="0.05" value={config.samplingTemp} onChange={e => setConfig({...config, samplingTemp:parseFloat(e.target.value)})} className="w-full h-1 bg-slate-800 appearance-none rounded" />
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Diversity λ</span><span>{config.diversityLambda}</span></div>
+                <input type="range" min="0" max="1" step="0.05" value={config.diversityLambda} onChange={e => setConfig({...config, diversityLambda:parseFloat(e.target.value)})} className="w-full h-1 bg-slate-800 appearance-none rounded" />
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Graph Wt</span><span>{config.graphWeight}</span></div>
+                <input type="range" min="0" max="1" step="0.05" value={config.graphWeight} onChange={e => setConfig({...config, graphWeight:parseFloat(e.target.value)})} className="w-full h-1 bg-slate-800 appearance-none rounded" />
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Echo Wt</span><span>{config.echoWeight}</span></div>
+                <input type="range" min="0" max="0.5" step="0.05" value={config.echoWeight} onChange={e => setConfig({...config, echoWeight:parseFloat(e.target.value)})} className="w-full h-1 bg-slate-800 appearance-none rounded" />
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Max Mem</span><span>{config.maxMemory}</span></div>
+                <input type="range" min="20" max="300" step="10" value={config.maxMemory} onChange={e => setConfig({...config, maxMemory:parseInt(e.target.value)})} className="w-full h-1 bg-slate-800 appearance-none rounded" />
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Decay</span><span>{config.decayRate}</span></div>
+                <input type="range" min="0.85" max="1" step="0.01" value={config.decayRate} onChange={e => setConfig({...config, decayRate:parseFloat(e.target.value)})} className="w-full h-1 bg-slate-800 appearance-none rounded" />
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Gate</span><span>{config.noveltyThreshold.toFixed(3)}</span></div>
+              </div>
+              <div className="space-y-3">
+                <div className="flex justify-between text-[10px] font-mono"><span>Fitness Min</span><span>{config.fitnessThreshold}</span></div>
+                <input type="range" min="0" max="1" step="0.05" value={config.fitnessThreshold} onChange={e => setConfig({...config, fitnessThreshold:parseFloat(e.target.value)})} className="w-full h-1 bg-slate-800 appearance-none rounded" />
+              </div>
+              <div className="pt-4 border-t border-slate-800 space-y-4">
+                <button onClick={() => wipeMemory()} className="w-full text-center text-red-500 text-[10px] uppercase font-bold hover:underline">Full System Purge</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="glass-panel rounded-xl p-4 flex flex-col lg:col-span-1 overflow-hidden">
+          <h2 className="text-[10px] font-black uppercase text-slate-500 mb-3 tracking-widest">Neural Stream</h2>
+          <div className="log-container flex-1 overflow-y-auto space-y-2 pr-2 font-mono text-[10px]">
+            {logs.map((log,i) => (
+              <div key={i} className={`p-1 ${log.includes('RESCUE')?'text-red-400':log.includes('SYSTEM')?'text-emerald-400':log.includes('EVOLVE')?'text-yellow-400':'text-slate-500'}`}>{log}</div>
+            ))}
+          </div>
+        </section>
+
+        <section className="lg:col-span-2 flex flex-col gap-4 overflow-hidden">
+          <div className="glass-panel rounded-xl p-4 flex-1 flex flex-col overflow-hidden">
+            <div className="chat-container flex-1 overflow-y-auto space-y-4 pr-2 mb-4">
+              {chat.map((m,i) => (
+                <div key={i} className={`p-4 rounded-xl text-xs font-mono border ${m.role==='user'?'bg-slate-800/50 border-slate-700 self-end ml-10':'bg-cyan-900/10 border-cyan-500/20 self-start mr-10'}`}>
+                  <span className="opacity-30 block mb-1">[{m.role==='user'?'USER':'ACTUATOR'}]</span>
+                  {m.text}
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-2 p-2 bg-black/40 rounded-xl">
+              <input type="text" value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>e.key==='Enter'&&handleExecute()} placeholder="Interact with evolved brain..." className="flex-1 bg-transparent p-2 text-xs outline-none" />
+              <button onClick={handleExecute} className="bg-cyan-600 hover:bg-cyan-500 text-white px-5 py-2 rounded-lg font-black text-[10px] uppercase">Execute</button>
+            </div>
+          </div>
+          <div className="grid grid-cols-4 gap-4 text-center">
+            <div className="glass-panel p-3 rounded-xl"><div className="text-[8px] text-slate-500 uppercase">Shards</div><div className="text-sm font-mono text-cyan-400">{telemetry.nodes}</div></div>
+            <div className="glass-panel p-3 rounded-xl"><div className="text-[8px] text-slate-500 uppercase">Gen</div><div className="text-sm font-mono text-cyan-400">{telemetry.evolutionGen}</div></div>
+            <div className="glass-panel p-3 rounded-xl"><div className="text-[8px] text-slate-500 uppercase">Entropy</div><div className="text-sm font-mono text-cyan-400">{telemetry.entropy}</div></div>
+            <div className="glass-panel p-3 rounded-xl"><div className="text-[8px] text-slate-500 uppercase">Mode</div><div className={`text-sm font-mono ${telemetry.rescue?'text-red-400':'text-cyan-400'}`}>{telemetry.rescue?'RESCUE':'NORM'}</div></div>
+          </div>
+        </section>
+      </main>
+
+      {isModalOpen && (
+        <div className="source-modal-overlay absolute inset-0 z-50 p-10 flex flex-col">
+          <div className="glass-panel rounded-3xl overflow-hidden flex flex-col flex-1 border border-cyan-500/30">
+            <div className="p-4 bg-slate-800 flex justify-between items-center">
+              <span className="text-xs font-black uppercase tracking-widest text-cyan-400">Memory Repository</span>
+              <button onClick={()=>setIsModalOpen(false)} className="bg-red-500/20 text-red-400 px-4 py-1 rounded font-bold text-xs">EXIT</button>
+            </div>
+            <pre className="flex-1 overflow-auto p-6 font-mono text-[10px] bg-black/80">{JSON.stringify(memoryBank.current, null, 2)}</pre>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
